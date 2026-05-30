@@ -46,7 +46,7 @@ Calibration runs **fresh on every invocation** unless the user saves the model t
 - **Synthetic OHLC** at the requested aggregation (built from an internal tick path).
 - **Tick-level view** with **real market** close, return, regime label, and explanation for each timestamp in the generation window.
 
-Synthetic generation uses a **semi-Markov regime walk**: stay in a regime for a sampled duration (from historical episode lengths), then transition according to the learned matrix, sampling returns from that regime’s specs.
+Synthetic generation uses a **semi-Markov regime walk** (see §3.4): stay in a regime for a sampled duration (from historical episode lengths), then transition according to the learned matrix, sampling returns from that regime’s specs.
 
 ---
 
@@ -82,6 +82,71 @@ Every bar is classified into one of seven **bands** based on **trailing trend st
 ### 3.3 Descriptive vs predictive labelling
 
 Regime labels are **descriptive** (what the trailing window looked like in hindsight). They are **not** a real-time trading signal and are **not** used to predict the next bar during generation.
+
+### 3.4 Regime dynamics — semi-Markov process
+
+During **simulation**, the synthetic path does not pick a random regime independently on every bar. Instead it **walks through regimes** using a **semi-Markov** model learned from history:
+
+1. **Start** in a regime drawn from historical **occupancy** (how often each regime appeared).
+2. **Stay** in that regime for a **dwell time** — a random number of bars sampled from that regime’s historical **episode lengths**.
+3. When the dwell expires, **transition** to the next regime using the **transition matrix**.
+4. Repeat until the generation window is filled.
+
+This produces **runs** of the same synthetic regime (episodes), with persistence and hand-offs that resemble the calibrated stock’s history.
+
+#### Episode
+
+An **episode** is a contiguous stretch of bars with the **same trend label** in the calibration history. Example: twelve daily bars labelled “positive” in a row = one positive episode of length 12.
+
+Calibration records, per regime:
+
+| Statistic | Meaning |
+|-----------|---------|
+| **n_episodes** | How many distinct runs of this regime occurred |
+| **mean_duration** | Average episode length in bars |
+| **durations** (internal) | Full list of episode lengths — used to bootstrap dwell times in simulation |
+
+#### Transition matrix
+
+A **7×7 matrix** where row *i* is “given we are leaving a regime-*i* episode, what is the probability the **next episode** is regime *j*?”
+
+- Rows correspond to **current** regime (strongly negative … strongly positive).
+- Columns correspond to **next** regime.
+- Each row sums to 1 (or 0 if that regime never appeared as a hand-off in history).
+- Counts are taken **episode → episode** (not bar → bar), so transitions happen only when a regime run ends.
+
+**Business reading:** If “positive” often follows “mildly positive” in history, that pair gets high probability. If “strongly negative” rarely follows “strongly positive”, that cell stays small.
+
+#### Semi-Markov vs plain Markov
+
+| Model | Behaviour |
+|-------|-----------|
+| **Markov chain** | New regime (or same regime) chosen **every bar**; persistence comes only from self-transitions on the diagonal. |
+| **Semi-Markov (this module)** | Regime is **held fixed** for a whole dwell period, then the next regime is chosen. Dwell length is **explicitly** sampled from historical episode lengths, not implied by a fixed transition rate. |
+
+So the module captures both **“how long trends last”** (dwell) and **“what tends to follow what”** (transitions).
+
+#### Simulation algorithm (summary)
+
+```
+cur ← sample initial regime from occupancy
+while ticks remain:
+    dwell ← sample from historical episode lengths for cur (min 1 bar)
+    for each bar in dwell:
+        return ← fundamental(cur) + jitter(cur)   (+ gap at session open if per-min)
+    cur ← sample next regime from transition row for cur
+        (if row is empty, restart from occupancy)
+```
+
+**Jitter carries memory across regime changes** (one AR(1) state for the whole path). **Fundamental** and **gap** samples are regime-specific at each bar.
+
+#### What the Markov layer does *not* do
+
+- It does **not** label the **real market** columns (`actual_regime`) on the tick overlay — those always come from trailing *t*-stats on actual prices.
+- It does **not** forecast which regime the stock will be in on a given future date.
+- It does **not** guarantee synthetic occupancy matches historical occupancy exactly (stochastic paths will vary by seed).
+
+Access in code: `model.transition` (7×7 array), `model.durations`, `model.occupancy`; synthetic path labels in `GeneratedSeries.regime_path`.
 
 ---
 
@@ -282,6 +347,10 @@ One row per regime. Key columns:
 | jitter_sd, jitter_rho | Microstructure noise size; negative ρ ≈ bounce, positive ρ ≈ brief momentum |
 | gap_mean, gap_sd | Overnight gap stats (per-minute only; daily skips gaps) |
 
+The **transition matrix** is stored on the model (`model.transition`, 7×7) but not printed in the summary table; see §3.4.
+
+Synthetic run occupancy is available via `GeneratedSeries.regime_occupancy()` (from `regime_path`).
+
 ### 5.2 Tick path (tail view in `example.py`)
 
 After generation, the module attaches **real market** fields:
@@ -442,6 +511,11 @@ print(gen.trend_score(15))
 | **DistributionSpec** | Four-moment summary: mean, SD, skewness, excess kurtosis |
 | **Regime** | One of seven trend buckets from trailing t-stat |
 | **Episode** | Contiguous run of bars in the same regime |
+| **Dwell time** | Number of bars the synthetic path stays in one regime before transitioning |
+| **Transition matrix** | 7×7 probabilities of next regime given current regime (episode → episode) |
+| **Semi-Markov** | Regime held for a random dwell, then transition; dwell lengths from history |
+| **Occupancy** | Fraction of calibration bars spent in each regime |
+| **regime_path** | Per-tick synthetic regime labels driving simulation (not real market) |
 | **Fundamental** | Regime’s core return distribution (drift + shape); i.i.d. per bar |
 | **Jitter** | Short-term AR(1) noise on top of fundamental; carries memory via ρ |
 | **Gap** | Overnight jump: log(open / prior close), per-minute sessions |
