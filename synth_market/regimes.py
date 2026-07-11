@@ -26,6 +26,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
+from typing import TypedDict
 
 import ohlcutils
 from ohlcutils.enums import Periodicity
@@ -33,6 +34,11 @@ from ohlcutils.enums import Periodicity
 from .distribution import DistributionSpec
 from .jitter import JitterSpec
 from .fit import decompose_segments, fit_distribution
+
+
+class RegimeSpecPair(TypedDict):
+    fundamental: DistributionSpec
+    jitter: JitterSpec
 
 
 LABELS = (
@@ -57,7 +63,7 @@ class RegimeModel:
     end: str
     window: int
     cuts: tuple[float, float, float]
-    specs: dict[str, dict[str, object]]          # label -> {"fundamental":..., "jitter":...}
+    specs: dict[str, RegimeSpecPair]             # label -> {"fundamental":..., "jitter":...}
     gaps: dict[str, DistributionSpec]            # label -> gap spec (empty for DAILY)
     transition: np.ndarray                       # 7x7, row-stochastic (episode->episode)
     occupancy: dict[str, float]                  # label -> fraction of bars
@@ -138,8 +144,8 @@ def daily_returns_frame(df: pd.DataFrame) -> pd.DataFrame:
         out["aopen"] = df["aopen"].astype(float)
     else:
         out["aopen"] = out["aclose"]
-    out["session"] = df.index.normalize()
-    logc = np.log(out["aclose"])
+    out["session"] = pd.DatetimeIndex(df.index).normalize()
+    logc = pd.Series(np.log(out["aclose"].to_numpy(dtype=np.float64)), index=out.index)
     out["ret"] = logc.diff()
     return out
 
@@ -199,8 +205,9 @@ def market_regime_frame(
                     return ix
             return None
         # intraday: align naive generated stamps to tz-aware market index
-        if data.index.tz is not None and ts.tz is None:
-            ts = ts.tz_localize(data.index.tz)
+        didx = pd.DatetimeIndex(data.index)
+        if didx.tz is not None and ts.tz is None:
+            ts = ts.tz_localize(didx.tz)
             if ts in data.index:
                 return ts
         return None
@@ -261,8 +268,8 @@ def _load_returns(symbol: str, periodicity: Periodicity, start: str, end: str,
     out = pd.DataFrame(index=df.index)
     out["aclose"] = df["aclose"].astype(float)
     out["aopen"] = df["aopen"].astype(float)
-    out["session"] = df.index.normalize()
-    logc = np.log(out["aclose"])
+    out["session"] = pd.DatetimeIndex(df.index).normalize()
+    logc = pd.Series(np.log(out["aclose"].to_numpy(dtype=np.float64)), index=out.index)
     out["ret"] = logc.groupby(out["session"]).diff()
     return out
 
@@ -394,7 +401,7 @@ def calibrate(
         )
 
     # --- decompose each label ---
-    specs: dict[str, dict[str, object]] = {}
+    specs: dict[str, RegimeSpecPair] = {}
     thin = []
     for lab in LABELS:
         if obs_by_label[lab] < min_obs_per_label:
