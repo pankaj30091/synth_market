@@ -128,6 +128,33 @@ def explain_regime(t: float, cuts: tuple[float, float, float]) -> tuple[str, str
     return label, reason
 
 
+def daily_returns_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Build a _load_returns-style frame from daily ohlcutils bars (aclose, optional aopen)."""
+    if df.empty or "aclose" not in df.columns:
+        raise KeyError("Expected non-empty daily bars with column 'aclose'.")
+    out = pd.DataFrame(index=df.index)
+    out["aclose"] = df["aclose"].astype(float)
+    if "aopen" in df.columns:
+        out["aopen"] = df["aopen"].astype(float)
+    else:
+        out["aopen"] = out["aclose"]
+    out["session"] = df.index.normalize()
+    logc = np.log(out["aclose"])
+    out["ret"] = logc.diff()
+    return out
+
+
+def _slice_returns_data(data: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
+    t0 = pd.Timestamp(start).normalize()
+    t1 = pd.Timestamp(end).normalize()
+    idx = pd.DatetimeIndex(data.index).tz_localize(None)
+    mask = (idx >= t0) & (idx <= t1)
+    sliced = data.loc[mask]
+    if sliced.empty:
+        raise ValueError(f"No return data in preload for {start}..{end}")
+    return sliced
+
+
 def market_regime_frame(
     symbol: str,
     periodicity: Periodicity,
@@ -135,6 +162,7 @@ def market_regime_frame(
     window: int,
     cuts: tuple[float, float, float] = DEFAULT_CUTS,
     load_kwargs: dict | None = None,
+    preload: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Real-market log returns and regime labels for `index`, using the same
@@ -145,11 +173,14 @@ def market_regime_frame(
     """
     if len(index) == 0:
         raise ValueError("index must not be empty")
-    # Load extra history so the rolling window is full for the first gen tick.
-    pad = window * 3 if periodicity == Periodicity.DAILY else window
-    start = (index.min() - pd.tseries.offsets.BDay(pad)).strftime("%Y-%m-%d")
-    end = index.max().strftime("%Y-%m-%d")
-    data = _load_returns(symbol, periodicity, start, end, load_kwargs)
+    if preload is not None:
+        data = preload
+    else:
+        # Load extra history so the rolling window is full for the first gen tick.
+        pad = window * 3 if periodicity == Periodicity.DAILY else window
+        start = (index.min() - pd.tseries.offsets.BDay(pad)).strftime("%Y-%m-%d")
+        end = index.max().strftime("%Y-%m-%d")
+        data = _load_returns(symbol, periodicity, start, end, load_kwargs)
     ret = data["ret"]
     aclose = data["aclose"]
     s = pd.Series(ret.to_numpy(dtype=np.float64), index=data.index)
@@ -222,22 +253,17 @@ def _load_returns(symbol: str, periodicity: Periodicity, start: str, end: str,
     df = ohlcutils.data.load_symbol(symbol, **kwargs)
     if df.empty:
         raise ValueError(f"No data returned for {symbol} {start}..{end} @ {periodicity}")
+    if periodicity == Periodicity.DAILY:
+        return daily_returns_frame(df)
     for col in ("aclose", "aopen"):
         if col not in df.columns:
             raise KeyError(f"Expected column '{col}' missing from loaded data.")
-
     out = pd.DataFrame(index=df.index)
     out["aclose"] = df["aclose"].astype(float)
     out["aopen"] = df["aopen"].astype(float)
     out["session"] = df.index.normalize()
-
     logc = np.log(out["aclose"])
-    if periodicity == Periodicity.DAILY:
-        # Daily: consecutive days form one contiguous return stream.
-        out["ret"] = logc.diff()
-    else:
-        # Intraday: within-session returns only (drop overnight).
-        out["ret"] = logc.groupby(out["session"]).diff()
+    out["ret"] = logc.groupby(out["session"]).diff()
     return out
 
 
@@ -266,6 +292,7 @@ def calibrate(
     min_gap_obs: int = 30,
     max_lag: int = 6,
     load_kwargs: dict | None = None,
+    preload: pd.DataFrame | None = None,
 ) -> RegimeModel:
     """
     Calibrate a RegimeModel for `symbol` over [start, end] at `periodicity`.
@@ -288,7 +315,10 @@ def calibrate(
     if window < 4:
         raise ValueError(f"window must be >= 4, got {window}")
 
-    data = _load_returns(symbol, periodicity, start, end, load_kwargs)
+    if preload is None:
+        data = _load_returns(symbol, periodicity, start, end, load_kwargs)
+    else:
+        data = _slice_returns_data(preload, start, end)
     rets = data["ret"]
     valid = rets.notna()
     r = rets[valid]
